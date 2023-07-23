@@ -1,0 +1,211 @@
+import argparse
+import os
+
+from yaml import parse
+join = os.path.join
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+import monai
+from monai.transforms import (
+    Activations,
+    AsChannelFirstd,
+    AddChanneld,
+    AsDiscrete,
+    Compose,
+    SpatialPadd,
+    RandSpatialCropd,
+    RandRotate90d,
+    ScaleIntensityd,
+    RandAxisFlipd,
+    RandZoomd,
+    RandGaussianNoised,
+    RandAdjustContrastd,
+    RandGaussianSmoothd,
+    RandHistogramShiftd,
+    EnsureTyped,
+    EnsureType,
+    Resized,
+    NormalizeIntensityd,
+)
+from dataset.dataset import TwoStreamBatchSampler
+# from models.unetr2d import UNETR2D
+from dataset.dataset import CustomDataset,CustomDataset_NIPS,CustomDataset_CRC
+from plmodule.NIPS_SSL import MeanTeacher
+from plmodule.BBDA import Pretrain,Distill,ThreeDistill,ThreeDistill_New_DisMethod,Semi_Distill_DA
+from plmodule.BBDA_full import Semi_Distill_DA_full,Semi_Distill_DA_None,Semi_Distill_DA_Weight,Semi_Distill_DA_PL,Semi_Distill_DA_Unsuper
+import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
+from utils.load_plmodel import load_stat_dict
+from datetime import datetime
+import random
+import shutil
+def seed_torch(seed=1029):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+	torch.backends.cudnn.benchmark = False
+	torch.backends.cudnn.deterministic = True
+
+seed_torch()
+def _init_fn(worker_id):
+    np.random.seed(int(1029)+worker_id)
+parser = argparse.ArgumentParser("Baseline for Microscopy image segmentation")
+# Dataset parameters
+parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
+parser.add_argument('--consistency', type=float,
+                    default=0.1, help='consistency')
+parser.add_argument('--consistency_rampup', type=float,
+                    default=100.0, help='consistency_rampup')
+parser.add_argument(
+                    "--work_dir", default="", \
+                        help="path where to save models and logs"
+)
+# parser.add_argument("--resume", default=False, help="resume from checkpoint")
+parser.add_argument("--num_workers", default=8, type=int)
+
+# Model parameters
+parser.add_argument(
+                    "--model_name", default="unet", help="select mode: unet"
+)
+parser.add_argument("--num_class", default=2, type=int, help="segmentation classes")
+parser.add_argument(
+                    "--input_size", default=256, type=int, help="input_size"
+)
+# Training parameters
+parser.add_argument("--batch_size", default=16, type=int, help="Batch size per GPU")
+parser.add_argument('--labeled_bs', type=int, default=8,
+                    help='labeled_batch_size per gpu')
+parser.add_argument("--max_epochs", default=500, type=int)
+parser.add_argument("--val_interval", default=5, type=int)
+parser.add_argument("--epoch_tolerance", default=300, type=int)
+parser.add_argument("--initial_lr", type=float, default=6e-4, help="learning rate")
+parser.add_argument("--pretrained_model_path", type=str, default='/media/oem/sda21/wxg/lightning_logs/TCIA/checkpoints/best_model.ckpt', help="pretrained model path")
+parser.add_argument("--sw_batch_size", type=str, default=None, help="sw_batch_size")
+parser.add_argument("--roi_size", type=str, default=None, help="roi_size")
+args = parser.parse_args()
+def bbda(args):
+    model_path = join(args.work_dir, "checkpoints")
+    os.makedirs(model_path, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d-%H%M")
+    shutil.copyfile(
+        __file__, join(model_path, run_id + "_" + os.path.basename(__file__))
+    )
+    root_dir = join(model_path, run_id + "_" + os.path.basename(__file__).split(".")[0])
+    if args.model_name.lower() == "unet":
+        model = monai.networks.nets.UNet(
+            spatial_dims=2,
+            in_channels=3,
+            out_channels=args.num_class,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        )
+        ema_model = monai.networks.nets.UNet(
+            spatial_dims=2,
+            in_channels=3,
+            out_channels=args.num_class,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        )
+        for param in ema_model.parameters():
+            param.detach_()
+
+
+    train_transforms = Compose(
+        [
+            AddChanneld(keys=["label"], allow_missing_keys=True),  # label: (1, H, W)
+            AsChannelFirstd(
+                keys=["img"], channel_dim=-1, allow_missing_keys=True
+            ),  # image: (3, H, W)
+            ScaleIntensityd(
+                keys=["img"], allow_missing_keys=True
+            ),  # Do not scale label
+            # ScaleIntensityd(keys=["label"],dtype=np.uint8, allow_missing_keys=True),#label 256->1
+            SpatialPadd(keys=["img", "label"], spatial_size=args.input_size),
+            RandSpatialCropd(
+                keys=["img", "label"], roi_size=args.input_size, random_size=False
+            ),
+            RandAxisFlipd(keys=["img", "label"], prob=0.5),
+            RandRotate90d(keys=["img", "label"], prob=0.5, spatial_axes=[0, 1]),
+            # intensity transform
+            RandGaussianNoised(keys=["img"], prob=0.25, mean=0, std=0.1),
+            RandAdjustContrastd(keys=["img"], prob=0.25, gamma=(1, 2)),
+            RandGaussianSmoothd(keys=["img"], prob=0.25, sigma_x=(1, 2)),
+            RandHistogramShiftd(keys=["img"], prob=0.25, num_control_points=3),
+            RandZoomd(
+                keys=["img", "label"],
+                prob=0.15,
+                min_zoom=0.8,
+                max_zoom=1.5,
+                mode=["area", "nearest"],
+            ),
+            EnsureTyped(keys=["img", "label"]),
+        ]
+    )
+
+    val_transforms = Compose(
+        [
+            AddChanneld(keys=["label"], allow_missing_keys=True),
+            AsChannelFirstd(keys=["img"], channel_dim=-1, allow_missing_keys=True),
+            # Resized(keys=["img", "label"], spatial_size=(args.input_size,args.input_size), mode=["area", "nearest"]),
+            RandSpatialCropd(
+                keys=["img", "label"], roi_size=512, random_size=False
+            ),
+            ScaleIntensityd(keys=["img"], allow_missing_keys=True),
+            # ScaleIntensityd(keys=["label"],dtype=np.uint8, allow_missing_keys=True),
+            # AsDiscreted(keys=['label'], to_onehot=3),
+            EnsureTyped(keys=["img", "label"]),
+        ]
+    )
+
+    net3 = monai.networks.nets.UNet(
+            spatial_dims=2,
+            in_channels=3,
+            out_channels=args.num_class,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        )
+    net2 = monai.networks.nets.UNet(
+            spatial_dims=2,
+            in_channels=3,
+            out_channels=args.num_class,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        )
+    net1 = monai.networks.nets.UNet(
+            spatial_dims=2,
+            in_channels=3,
+            out_channels=args.num_class,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        )
+    net3.load_state_dict(load_stat_dict(torch.load('')['state_dict']))
+    net2.load_state_dict(load_stat_dict(torch.load('')['state_dict']))
+    net1.load_state_dict(load_stat_dict(torch.load('')['state_dict']))
+    #set semi dataset
+    tr_ds = CustomDataset_CRC(labeled_file='',unlabeled_file='',transform=train_transforms)
+    labeled_idxs = list(range(tr_ds.num_labeled))
+    unlabeled_idxs = list(range(tr_ds.num_labeled, len(tr_ds)))
+    unlabeled_batch_size = args.batch_size-args.labeled_bs
+    batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs,batch_size=args.batch_size,\
+        secondary_batch_size=unlabeled_batch_size)
+    #end
+    val_ds = CustomDataset_CRC(labeled_file='',transform=val_transforms)
+    train_loader = DataLoader(tr_ds, batch_sampler=batch_sampler,\
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),worker_init_fn=_init_fn)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.num_workers,pin_memory=torch.cuda.is_available())
+    plmodel = Semi_Distill_DA_full(args,model=model,ema_model=ema_model,model1=net1,model2=net2,model3=net3)
+    # plmodel = ThreeDistill(args,model=model,model1=net1,model2=net2,model3=net3)
+    trainer = pl.Trainer(accelerator='gpu',devices=1, max_epochs=args.max_epochs,check_val_every_n_epoch=args.val_interval,\
+                auto_scale_batch_size=True,auto_select_gpus=True,default_root_dir=root_dir)#strategy=DDPStrategy(find_unused_parameters=False)
+    trainer.fit(plmodel, train_loader, val_loader)
+if __name__ == "__main__":
+    bbda(args)
